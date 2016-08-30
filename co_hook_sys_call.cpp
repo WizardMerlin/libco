@@ -43,92 +43,83 @@
 
 typedef long long ll64_t;
 
+/* 套接字hook信息结构 - 存储hook函数中跟套接字相关的信息
+ *
+ * 为什么需要该结构呢? - 举例说明, 套接字的O_NONBLOCK属性决定了hook后的read函数是直接调用系统的read函数,
+ * 还是先向内核注册事件(向内核注册事件时又需要读超时时间), 然后切换协程并等待事件发生时切换回该协程, 最后调用
+ * 系统的read函数. 如果不把这些信息(是否O_NONBLOCK, 读写超时时间等)传递到被hook函数中, 我们就无法实现hook
+ * 函数的逻辑. 这就是需要该结构的原因！
+ *
+ * 说句题外话, 其实我觉得该结构是非必需的, O_NONBLOCK属性可通过未hook的fcntl函数获得, 超时时间采用全局设置也未尝不可.
+ * */
 struct rpchook_t
 {
-	int user_flag;
-	struct sockaddr_in dest; //maybe sockaddr_un;
-	int domain; //AF_LOCAL , AF_INET
+	int user_flag;                                   // 套接字的阻塞/非阻塞属性
+	struct sockaddr_in dest; //maybe sockaddr_un;    // 套接字目的主机地址
+	int domain; //AF_LOCAL , AF_INET                 // 套接字类型
 
-	struct timeval read_timeout;
-	struct timeval write_timeout;
+	struct timeval read_timeout;                     // 套接字读超时时间
+	struct timeval write_timeout;                    // 该套接写超时时间
 };
+
+/* 获取线程id */
 static inline pid_t GetPid()
 {
 	char **p = (char**)pthread_self();
 	return p ? *(pid_t*)(p + 18) : getpid();
 }
+
+/* 套接字hook信息数组 - 存储(该线程内)所有协程中的套接字hook信息, 便于套接字hook信息在被hook的系统调用之间传递,
+ * 部分被hook函数用这些信息来控制函数逻辑(详见下面被hook的系统调用).
+ *
+ * 理解这个数组是重点, 一部分被hook的系统调用初始化这些数组中的元素, 另一部分被hook的系统调用获取数组元素来控制函数逻辑.
+ * */
 static rpchook_t *g_rpchook_socket_fd[ 102400 ] = { 0 };
 
+/* 对每个被hook的系统调用声明一种函数指针类型 */
 typedef int (*socket_pfn_t)(int domain, int type, int protocol);
 typedef int (*connect_pfn_t)(int socket, const struct sockaddr *address, socklen_t address_len);
 typedef int (*close_pfn_t)(int fd);
-
 typedef ssize_t (*read_pfn_t)(int fildes, void *buf, size_t nbyte);
 typedef ssize_t (*write_pfn_t)(int fildes, const void *buf, size_t nbyte);
-
 typedef ssize_t (*sendto_pfn_t)(int socket, const void *message, size_t length,
 	                 int flags, const struct sockaddr *dest_addr,
 					               socklen_t dest_len);
-
 typedef ssize_t (*recvfrom_pfn_t)(int socket, void *buffer, size_t length,
 	                 int flags, struct sockaddr *address,
 					               socklen_t *address_len);
-
 typedef size_t (*send_pfn_t)(int socket, const void *buffer, size_t length, int flags);
 typedef ssize_t (*recv_pfn_t)(int socket, void *buffer, size_t length, int flags);
-
 typedef int (*poll_pfn_t)(struct pollfd fds[], nfds_t nfds, int timeout);
 typedef int (*setsockopt_pfn_t)(int socket, int level, int option_name,
 			                 const void *option_value, socklen_t option_len);
-
 typedef int (*fcntl_pfn_t)(int fildes, int cmd, ...);
 typedef struct tm *(*localtime_r_pfn_t)( const time_t *timep, struct tm *result );
-
 typedef void *(*pthread_getspecific_pfn_t)(pthread_key_t key);
 typedef int (*pthread_setspecific_pfn_t)(pthread_key_t key, const void *value);
-
 typedef int (*pthread_rwlock_rdlock_pfn_t)(pthread_rwlock_t *rwlock);
 typedef int (*pthread_rwlock_wrlock_pfn_t)(pthread_rwlock_t *rwlock);
 typedef int (*pthread_rwlock_unlock_pfn_t)(pthread_rwlock_t *rwlock);
 
+/* 将动态库中被hook的系统调用的地址(即函数指针)绑定到以g_sys_##name##__func命名的函数指针
+ *
+ * 为什么要这么做呢? - 这样做的目的是在链接阶段让系统调用在动态库中找不到对应的实现, 而来链接到我们代码中的同名函数(即被hook的函数)
+ * */
 static socket_pfn_t g_sys_socket_func 	= (socket_pfn_t)dlsym(RTLD_NEXT,"socket");
 static connect_pfn_t g_sys_connect_func = (connect_pfn_t)dlsym(RTLD_NEXT,"connect");
 static close_pfn_t g_sys_close_func 	= (close_pfn_t)dlsym(RTLD_NEXT,"close");
-
 static read_pfn_t g_sys_read_func 		= (read_pfn_t)dlsym(RTLD_NEXT,"read");
 static write_pfn_t g_sys_write_func 	= (write_pfn_t)dlsym(RTLD_NEXT,"write");
-
 static sendto_pfn_t g_sys_sendto_func 	= (sendto_pfn_t)dlsym(RTLD_NEXT,"sendto");
 static recvfrom_pfn_t g_sys_recvfrom_func = (recvfrom_pfn_t)dlsym(RTLD_NEXT,"recvfrom");
-
 static send_pfn_t g_sys_send_func 		= (send_pfn_t)dlsym(RTLD_NEXT,"send");
 static recv_pfn_t g_sys_recv_func 		= (recv_pfn_t)dlsym(RTLD_NEXT,"recv");
-
 static poll_pfn_t g_sys_poll_func 		= (poll_pfn_t)dlsym(RTLD_NEXT,"poll");
-
-static setsockopt_pfn_t g_sys_setsockopt_func 
-										= (setsockopt_pfn_t)dlsym(RTLD_NEXT,"setsockopt");
+static setsockopt_pfn_t g_sys_setsockopt_func = (setsockopt_pfn_t)dlsym(RTLD_NEXT,"setsockopt");
 static fcntl_pfn_t g_sys_fcntl_func 	= (fcntl_pfn_t)dlsym(RTLD_NEXT,"fcntl");
 
-/*
-static pthread_getspecific_pfn_t g_sys_pthread_getspecific_func 
-			= (pthread_getspecific_pfn_t)dlsym(RTLD_NEXT,"pthread_getspecific");
 
-static pthread_setspecific_pfn_t g_sys_pthread_setspecific_func 
-			= (pthread_setspecific_pfn_t)dlsym(RTLD_NEXT,"pthread_setspecific");
-
-static pthread_rwlock_rdlock_pfn_t g_sys_pthread_rwlock_rdlock_func  
-			= (pthread_rwlock_rdlock_pfn_t)dlsym(RTLD_NEXT,"pthread_rwlock_rdlock");
-
-static pthread_rwlock_wrlock_pfn_t g_sys_pthread_rwlock_wrlock_func  
-			= (pthread_rwlock_wrlock_pfn_t)dlsym(RTLD_NEXT,"pthread_rwlock_wrlock");
-
-static pthread_rwlock_unlock_pfn_t g_sys_pthread_rwlock_unlock_func  
-			= (pthread_rwlock_unlock_pfn_t)dlsym(RTLD_NEXT,"pthread_rwlock_unlock");
-*/
-
-
-
+/* 未使用该函数 */
 static inline unsigned long long get_tick_count()
 {
 	uint32_t lo, hi;
@@ -138,6 +129,7 @@ static inline unsigned long long get_tick_count()
 	return ((unsigned long long)lo) | (((unsigned long long)hi) << 32);
 }
 
+/* 未使用该结构 */
 struct rpchook_connagent_head_t
 {
     unsigned char    bVersion;
@@ -149,9 +141,15 @@ struct rpchook_connagent_head_t
 	unsigned char    sReserved[6];
 }__attribute__((packed));
 
-
+/* hook系统调用 - 将动态库中名为name的系统调用地址(即函数指针)绑定到以g_sys_##name##__func命名的函数指针 */
 #define HOOK_SYS_FUNC(name) if( !g_sys_##name##_func ) { g_sys_##name##_func = (name##_pfn_t)dlsym(RTLD_NEXT,#name); }
 
+/*
+ * diff_ms - 计算以毫秒为单位的时间差
+ * @param begin - (input) 开始时间
+ * @param end - (input) 结束时间
+ * @return 毫秒为单位的时间差
+ * */
 static inline ll64_t diff_ms(struct timeval &begin,struct timeval &end)
 {
 	ll64_t u = (end.tv_sec - begin.tv_sec) ;
@@ -160,8 +158,11 @@ static inline ll64_t diff_ms(struct timeval &begin,struct timeval &end)
 	return u;
 }
 
-
-
+/*
+ * get_by_fd - 在套接字hook信息数组(g_rpchook_socket_fd)中获取套接字fd对应的rpchook_t类型变量的指针
+ * @param fd - (input) 套接字文件描述符
+ * @return 成功返回rpchook_t类型变量的指针, 失败返回NULL
+ * */
 static inline rpchook_t * get_by_fd( int fd )
 {
 	if( fd > -1 && fd < (int)sizeof(g_rpchook_socket_fd) / (int)sizeof(g_rpchook_socket_fd[0]) )
@@ -170,6 +171,12 @@ static inline rpchook_t * get_by_fd( int fd )
 	}
 	return NULL;
 }
+
+/*
+ * alloc_by_fd - 为套接字fd分配对应的rpchook_t类型类型的存储空间, 并将存储空间的地址加入到套接字hook信息数组(g_rpchook_socket_fd)中
+ * @param fd - (input) 套接字文件描述符
+ * @return 成功返回rpchook_t类型变量的指针, 失败返回NULL
+ * */
 static inline rpchook_t * alloc_by_fd( int fd )
 {
 	if( fd > -1 && fd < (int)sizeof(g_rpchook_socket_fd) / (int)sizeof(g_rpchook_socket_fd[0]) )
@@ -182,6 +189,12 @@ static inline rpchook_t * alloc_by_fd( int fd )
 	}
 	return NULL;
 }
+
+/*
+ * free_by_fd - 在套接字hook信息数组(g_rpchook_socket_fd)中释放套接字fd对应rpchook_t类型变量的存储空间
+ * @param fd - (input) 套接字文件描述符
+ * @return
+ * */
 static inline void free_by_fd( int fd )
 {
 	if( fd > -1 && fd < (int)sizeof(g_rpchook_socket_fd) / (int)sizeof(g_rpchook_socket_fd[0]) )
@@ -196,28 +209,38 @@ static inline void free_by_fd( int fd )
 	return;
 
 }
+
+
+/* socket - 被hook后的socket函数, 主要是为套接字fd分配对应的rpchook_t类型的内存空间, 并往g_rpchook_socket_fd中添加该内存空间的地址(指针指向的变量未全部初始化) */
 int socket(int domain, int type, int protocol)
 {
+	// 重命名动态库中的socket系统调用
 	HOOK_SYS_FUNC( socket );
 
+	// 协程禁止hook系统调用, 则直接调用socket系统调用返回socket文件描述符fd
 	if( !co_is_enable_sys_hook() )
 	{
 		return g_sys_socket_func( domain,type,protocol );
 	}
+
+	// 协程使用了hook, 则直接调用socket系统调用获取socket文件描述符fd
 	int fd = g_sys_socket_func(domain,type,protocol);
 	if( fd < 0 )
 	{
 		return fd;
 	}
 
+	// 为fd分配rpchook_t类型的内存空间, 其中存储套接字hook信息, 并将其加入套接字hook信息数组g_rpchook_socket_fd中
 	rpchook_t *lp = alloc_by_fd( fd );
 	lp->domain = domain;
-	
+
+	// 设置套接字fd属性
 	fcntl( fd, F_SETFL, g_sys_fcntl_func(fd, F_GETFL,0 ) );
 
 	return fd;
 }
 
+/* co_accpet - accpet系统调用的封装而已 */
 int co_accept( int fd, struct sockaddr *addr, socklen_t *len )
 {
 	int cli = accept( fd,addr,len );
@@ -229,6 +252,7 @@ int co_accept( int fd, struct sockaddr *addr, socklen_t *len )
 	return cli;
 }
 
+/* connect - 被hook后的connect函数, 主要是初始化(g_rpchook_socket_fd中)套接字fd对应的rpchook_t类型变量的dest成员 */
 int connect(int fd, const struct sockaddr *address, socklen_t address_len)
 {
 	HOOK_SYS_FUNC( connect );
@@ -258,46 +282,56 @@ int connect(int fd, const struct sockaddr *address, socklen_t address_len)
 	}
 	return ret;
 }
+
+/* close - 被hook后的close函数, 主要是释放(g_rpchook_socket_fd中)套接字fd对应的rpchook_t类型存储空间 */
 int close(int fd)
 {
 	HOOK_SYS_FUNC( close );
-	
+
+	// 协程禁止hook系统调用, 则直接调用系统调用
 	if( !co_is_enable_sys_hook() )
 	{
 		return g_sys_close_func( fd );
 	}
 
+	// 协程hook系统调用, 则释放(g_rpchook_socket_fd中)套接字fd对应的rpchook_t类型的存储空间
 	free_by_fd( fd );
 	int ret = g_sys_close_func(fd);
 
 	return ret;
 }
+
+/* read - 被hook后的read函数, 主要是向内核注册套接字fd上的事件 */
 ssize_t read( int fd, void *buf, size_t nbyte )
 {
 	HOOK_SYS_FUNC( read );
-	
+
+	// 协程禁止hook系统调用, 则直接调用系统调用
 	if( !co_is_enable_sys_hook() )
 	{
 		return g_sys_read_func( fd,buf,nbyte );
 	}
+
+	// 协程hook系统调用, 根据套接字是否为非阻塞选择不同的处理方式
 	rpchook_t *lp = get_by_fd( fd );
 
-	if( !lp || ( O_NONBLOCK & lp->user_flag ) ) 
+	// 非阻塞, 直接调用系统调用
+	if( !lp || ( O_NONBLOCK & lp->user_flag ) )
 	{
 		ssize_t ret = g_sys_read_func( fd,buf,nbyte );
 		return ret;
 	}
-	int timeout = ( lp->read_timeout.tv_sec * 1000 ) 
-				+ ( lp->read_timeout.tv_usec / 1000 );
 
+	// 阻塞, 向内核注册套接字fd的事件
+	// poll如果未hook,则直接调用poll系统调用;
+	// poll如果被hook,则调用co_poll向内核注册, co_poll中会切换协程, 协程被恢复时将会从co_poll中的挂起点继续运行
+	int timeout = ( lp->read_timeout.tv_sec * 1000 ) + ( lp->read_timeout.tv_usec / 1000 );
 	struct pollfd pf = { 0 };
 	pf.fd = fd;
 	pf.events = ( POLLIN | POLLERR | POLLHUP );
-
 	int pollret = poll( &pf,1,timeout );
 
 	ssize_t readret = g_sys_read_func( fd,(char*)buf ,nbyte );
-
 	if( readret < 0 )
 	{
 		co_log_err("CO_ERR: read fd %d ret %ld errno %d poll ret %d timeout %d",
@@ -307,24 +341,33 @@ ssize_t read( int fd, void *buf, size_t nbyte )
 	return readret;
 	
 }
+
+/* write - 被hook后的write函数, 主要是向内核注册套接字fd上的事件 */
 ssize_t write( int fd, const void *buf, size_t nbyte )
 {
 	HOOK_SYS_FUNC( write );
-	
+
+	// 协程禁止hook系统调用, 则直接调用系统调用
 	if( !co_is_enable_sys_hook() )
 	{
 		return g_sys_write_func( fd,buf,nbyte );
 	}
+
+	// 协程hook系统调用, 根据套接字是否为非阻塞选择不同的处理方式
 	rpchook_t *lp = get_by_fd( fd );
 
+	// 非阻塞, 直接调用系统调用
 	if( !lp || ( O_NONBLOCK & lp->user_flag ) )
 	{
 		ssize_t ret = g_sys_write_func( fd,buf,nbyte );
 		return ret;
 	}
+
+	// 阻塞, 向内核注册套接字fd的事件
+	// poll如果未hook,则直接调用poll系统调用;
+	// poll如果被hook,则调用co_poll向内核注册, co_poll中会切换协程, 协程被恢复时将会从co_poll中的挂起点继续运行
 	size_t wrotelen = 0;
-	int timeout = ( lp->write_timeout.tv_sec * 1000 ) 
-				+ ( lp->write_timeout.tv_usec / 1000 );
+	int timeout = ( lp->write_timeout.tv_sec * 1000 ) + ( lp->write_timeout.tv_usec / 1000 );
 
 	ssize_t writeret = g_sys_write_func( fd,(const char*)buf + wrotelen,nbyte - wrotelen );
 
@@ -334,7 +377,7 @@ ssize_t write( int fd, const void *buf, size_t nbyte )
 	}
 	while( wrotelen < nbyte )
 	{
-
+		// buf中的数据未全部写到fd上, 则向内核注册套接字fd的事件
 		struct pollfd pf = { 0 };
 		pf.fd = fd;
 		pf.events = ( POLLOUT | POLLERR | POLLHUP );
@@ -351,6 +394,7 @@ ssize_t write( int fd, const void *buf, size_t nbyte )
 	return wrotelen;
 }
 
+/* sendto - 被hook后的sendto函数, 主要是向内核注册套接字fd上的事件 */
 ssize_t sendto(int socket, const void *message, size_t length,
 	                 int flags, const struct sockaddr *dest_addr,
 					               socklen_t dest_len)
@@ -392,6 +436,7 @@ ssize_t sendto(int socket, const void *message, size_t length,
 	return ret;
 }
 
+/* recvfrom - 被hook后的recvfrom函数, 主要是向内核注册套接字fd上的事件 */
 ssize_t recvfrom(int socket, void *buffer, size_t length,
 	                 int flags, struct sockaddr *address,
 					               socklen_t *address_len)
@@ -421,6 +466,7 @@ ssize_t recvfrom(int socket, void *buffer, size_t length,
 	return ret;
 }
 
+/* send - 被hook后的send函数, 主要是向内核注册套接字fd上的事件 */
 ssize_t send(int socket, const void *buffer, size_t length, int flags)
 {
 	HOOK_SYS_FUNC( send );
@@ -465,6 +511,7 @@ ssize_t send(int socket, const void *buffer, size_t length, int flags)
 	return wrotelen;
 }
 
+/* recv - 被hook后的recv函数, 主要是向内核注册套接字fd上的事件 */
 ssize_t recv( int socket, void *buffer, size_t length, int flags )
 {
 	HOOK_SYS_FUNC( recv );
@@ -485,11 +532,9 @@ ssize_t recv( int socket, void *buffer, size_t length, int flags )
 	struct pollfd pf = { 0 };
 	pf.fd = socket;
 	pf.events = ( POLLIN | POLLERR | POLLHUP );
-
 	int pollret = poll( &pf,1,timeout );
 
 	ssize_t readret = g_sys_recv_func( socket,buffer,length,flags );
-
 	if( readret < 0 )
 	{
 		co_log_err("CO_ERR: read fd %d ret %ld errno %d poll ret %d timeout %d",
@@ -513,6 +558,8 @@ int poll(struct pollfd fds[], nfds_t nfds, int timeout)
 	return co_poll( co_get_epoll_ct(),fds,nfds,timeout );
 
 }
+
+/* setsockopt - 被hook后的setsockopt函数, 主要是初始化(g_rpchook_socket_fd中)套接字fd对应的rpchook_t类型变量的read_timeout和write_timeout成员 */
 int setsockopt(int fd, int level, int option_name,
 			                 const void *option_value, socklen_t option_len)
 {
@@ -539,7 +586,7 @@ int setsockopt(int fd, int level, int option_name,
 	return g_sys_setsockopt_func( fd,level,option_name,option_value,option_len );
 }
 
-
+/* fcntl - 被hook后的fcntl函数, 主要是初始化(g_rpchook_socket_fd中)套接字fd对应的rpchook_t类型变量的user_flag成员 */
 int fcntl(int fildes, int cmd, ...)
 {
 	HOOK_SYS_FUNC( fcntl );
@@ -628,80 +675,9 @@ int fcntl(int fildes, int cmd, ...)
 
 	return ret;
 }
-/*
-void *pthread_getspecific(pthread_key_t key)
-{
-	HOOK_SYS_FUNC( pthread_getspecific );
 
-	//printf("hook_getspec (%ld)\n",(long)key);
-	return g_sys_pthread_getspecific_func( key ); 
-}
-int pthread_setspecific(pthread_key_t key, const void *value)
-{
-	HOOK_SYS_FUNC( pthread_setspecific );
-	//printf("hook_setspec (%ld)\n",(long)key);
-	return g_sys_pthread_setspecific_func( key,value );
-}
-
-struct tm *localtime_r( const time_t *timep, struct tm *result )
-{
-	if( result )
-	{
-		memset( result,0,sizeof(*result) );
-	}
-	return result;
-}
-*/
-
-//static int g_rwlock_cnt[ 65536 ] = { 0 };
-/*
-static pid_t __GetThreadPid()
-{
-	char **p = (char**)pthread_self();
-	return p ? *(pid_t*)(p + 18) : 0;
-}
-
-
-int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
-{
-	HOOK_SYS_FUNC( pthread_rwlock_rdlock )
-	pid_t pid = __GetThreadPid();
-	int ret = g_sys_pthread_rwlock_rdlock_func(rwlock);
-	//++g_rwlock_cnt[ pid ];
-	return ret;
-}
-int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
-{
-	HOOK_SYS_FUNC( pthread_rwlock_wrlock )
-	pid_t pid = __GetThreadPid();
-	int ret = g_sys_pthread_rwlock_wrlock_func(rwlock);
-	//++g_rwlock_cnt[ pid ];
-	return ret;
-}
-int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
-{
-	HOOK_SYS_FUNC( pthread_rwlock_unlock )
-	pid_t pid = __GetThreadPid();
-	int ret = g_sys_pthread_rwlock_unlock_func(rwlock);
-	//--g_rwlock_cnt[ pid ];
-	return ret;
-}
-*/
-/*
-int GetThreadRWLockCnt( )
-{
-	return g_rwlock_cnt[ __GetThreadPid() ];
-}
-*/
-//g++ -O2 -fPIC  -DLINUX -pipe -c rpchook_sys_call.cpp  -o rpcdump.o
-//g++ -fPIC -shared -O2 -pipe rpcdump.o -o librpcdump.so
-//export LD_PRELOAD=$PWD/librpcdump.so
-//./test_kvcli_cpu batch_str str_kvsvr_cli.conf  1000
-//export LD_PRELOAD=;    
-//~/QQMail/comm2/svrkit> vi skutils.cpp 
-
-//gzrd_Lib_CPP_Version_ID--start
-void co_enable_hook_sys() //�⺯������������,�����ļ��ᱻ���ԣ�����
+/* co_enable_hook_sys - 设置当前线程中正在运行的协程中使用hook系统调用*/
+void co_enable_hook_sys() //这函数必须写在这里,否则本文件会被忽略!!!
 {
 	stCoRoutine_t *co = GetCurrThreadCo();
 	if( co )
